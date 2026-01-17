@@ -121,6 +121,12 @@ impl QuicTransport {
     }
 
     /// Accept incoming connections
+    ///
+    /// Note: Incoming connections are NOT stored in the peers map to avoid
+    /// conflating them with outgoing connections. In QUIC, when a client bound
+    /// to port X connects to a server, the server sees remote_addr as X.
+    /// If we also have an outgoing connection to X, storing the incoming
+    /// connection would overwrite it and break bidirectional communication.
     pub async fn accept(&self) -> Result<(SocketAddr, Arc<PeerConnection>)> {
         let incoming = self
             .endpoint
@@ -133,9 +139,8 @@ impl QuicTransport {
 
         let peer = Arc::new(PeerConnection::new(connection));
 
-        // Store in peers map
-        let mut peers = self.peers.write().await;
-        peers.insert(remote_addr, Arc::clone(&peer));
+        // Don't store incoming connections in peers map - they could conflict
+        // with outgoing connections to the same address
 
         tracing::info!("Accepted connection from {}", remote_addr);
 
