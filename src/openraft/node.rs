@@ -291,10 +291,11 @@ impl OpenRaftNode {
 
         // Create Raft config
         // Use longer timeouts to be more forgiving in real-world networks
+        // Note: heartbeat_interval is used as the timeout for AppendEntries RPCs
         let mut raft_config = RaftConfig::default();
-        raft_config.heartbeat_interval = 1000;    // 1 second (was 200ms)
-        raft_config.election_timeout_min = 3000;  // 3 seconds (was 800ms)
-        raft_config.election_timeout_max = 5000;  // 5 seconds (was 1600ms)
+        raft_config.heartbeat_interval = 3000;    // 3 seconds (was 200ms) - also used as AppendEntries RPC timeout
+        raft_config.election_timeout_min = 6000;  // 6 seconds (was 800ms)
+        raft_config.election_timeout_max = 10000; // 10 seconds (was 1600ms)
         #[cfg(feature = "simulation")]
         {
             raft_config.allow_log_reversion = Some(true);
