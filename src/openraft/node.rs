@@ -290,10 +290,11 @@ impl OpenRaftNode {
         );
 
         // Create Raft config
+        // Use longer timeouts to be more forgiving in real-world networks
         let mut raft_config = RaftConfig::default();
-        raft_config.heartbeat_interval = 200;
-        raft_config.election_timeout_min = 800;
-        raft_config.election_timeout_max = 1600;
+        raft_config.heartbeat_interval = 1000;    // 1 second (was 200ms)
+        raft_config.election_timeout_min = 3000;  // 3 seconds (was 800ms)
+        raft_config.election_timeout_max = 5000;  // 5 seconds (was 1600ms)
         #[cfg(feature = "simulation")]
         {
             raft_config.allow_log_reversion = Some(true);
