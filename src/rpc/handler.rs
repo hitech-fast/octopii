@@ -195,10 +195,18 @@ impl RpcHandler {
         req: RpcRequest,
         peer: Option<Arc<dyn Peer>>,
     ) {
+        let req_id = req.id;
+        tracing::info!("handle_request: processing request {} from {}", req_id, addr);
+
         let handler = self.request_handler.read().await;
 
         let response_payload = match handler.as_ref() {
-            Some(h) => h(req.clone()).await,
+            Some(h) => {
+                tracing::debug!("handle_request: invoking handler for request {}", req_id);
+                let result = h(req.clone()).await;
+                tracing::debug!("handle_request: handler completed for request {}", req_id);
+                result
+            }
             None => ResponsePayload::Error {
                 message: "No request handler registered".to_string(),
             },
@@ -209,9 +217,11 @@ impl RpcHandler {
         // Send response back on the same connection if peer is provided,
         // otherwise fall back to creating a new connection
         if let Ok(data) = serialize(&response) {
+            tracing::info!("handle_request: sending response for request {} ({} bytes) to {}", req_id, data.len(), addr);
             if let Some(peer) = peer {
-                if let Err(e) = peer.send(data).await {
-                    tracing::error!("Failed to send response via peer: {}", e);
+                match peer.send(data).await {
+                    Ok(()) => tracing::info!("handle_request: response sent successfully for request {}", req_id),
+                    Err(e) => tracing::error!("Failed to send response via peer for request {}: {}", req_id, e),
                 }
             } else {
                 if let Err(e) = self.transport.send(addr, data).await {
@@ -232,25 +242,39 @@ impl RpcHandler {
     async fn ensure_peer_receiver(self: &Arc<Self>, addr: SocketAddr, peer: Arc<dyn Peer>) {
         let mut receivers = self.peer_receivers.lock().await;
         if receivers.contains(&addr) {
+            tracing::debug!("Receiver already exists for {}", addr);
             return;
         }
         receivers.insert(addr);
         drop(receivers);
 
+        tracing::info!("Starting receive loop for peer {}", addr);
         let rpc = Arc::clone(self);
         tokio::spawn(async move {
+            tracing::info!("Receive loop started for peer {}", addr);
             loop {
+                tracing::debug!("Receive loop: waiting for message from {}", addr);
                 match peer.recv().await {
-                    Ok(Some(data)) => match deserialize::<RpcMessage>(&data) {
-                        Ok(msg) => {
-                            rpc.notify_message(addr, msg, Some(Arc::clone(&peer))).await;
-                        }
-                        Err(e) => {
-                            tracing::error!(
-                                "Failed to deserialize RPC message from {}: {}",
-                                addr,
-                                e
-                            );
+                    Ok(Some(data)) => {
+                        tracing::info!("Receive loop: got {} bytes from {}", data.len(), addr);
+                        match deserialize::<RpcMessage>(&data) {
+                            Ok(msg) => {
+                                let msg_type = match &msg {
+                                    RpcMessage::Request(r) => format!("Request(id={})", r.id),
+                                    RpcMessage::Response(r) => format!("Response(id={})", r.id),
+                                    RpcMessage::OneWay(_) => "OneWay".to_string(),
+                                };
+                                tracing::info!("Receive loop: processing {} from {}", msg_type, addr);
+                                rpc.notify_message(addr, msg, Some(Arc::clone(&peer))).await;
+                                tracing::debug!("Receive loop: done processing message from {}", addr);
+                            }
+                            Err(e) => {
+                                tracing::error!(
+                                    "Failed to deserialize RPC message from {}: {}",
+                                    addr,
+                                    e
+                                );
+                            }
                         }
                     },
                     Ok(None) => {
@@ -264,6 +288,7 @@ impl RpcHandler {
                 }
             }
 
+            tracing::info!("Receive loop ended for peer {}", addr);
             let mut receivers = rpc.peer_receivers.lock().await;
             receivers.remove(&addr);
         });
