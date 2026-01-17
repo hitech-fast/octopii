@@ -535,6 +535,23 @@ impl OpenRaftNode {
                                 data: bytes::Bytes::from(response_data),
                             }
                         }
+                        crate::rpc::RequestPayload::Custom { operation, data } if operation == "propose" => {
+                            // Handle forwarded propose requests from followers
+                            tracing::info!(
+                                "Node {}: Received forwarded propose request",
+                                node_id
+                            );
+                            match raft.client_write(AppEntry(data.to_vec())).await {
+                                Ok(resp) => crate::rpc::ResponsePayload::CustomResponse {
+                                    success: true,
+                                    data: bytes::Bytes::from(resp.data.0),
+                                },
+                                Err(e) => crate::rpc::ResponsePayload::CustomResponse {
+                                    success: false,
+                                    data: bytes::Bytes::from(e.to_string()),
+                                },
+                            }
+                        }
                         _ => crate::rpc::ResponsePayload::CustomResponse {
                             success: false,
                             data: bytes::Bytes::new(),
@@ -610,12 +627,49 @@ impl OpenRaftNode {
                 "propose leader id mismatch",
             );
         }
-        let resp = self
-            .raft
-            .client_write(AppEntry(command))
-            .await
-            .map_err(|e| crate::error::OctopiiError::Rpc(format!("client_write: {e}")))?;
-        Ok(Bytes::from(resp.data.0))
+
+        // Check if we're the leader
+        let metrics = self.raft.metrics().borrow().clone();
+        if metrics.state == ServerState::Leader {
+            // We're the leader, propose directly
+            let resp = self
+                .raft
+                .client_write(AppEntry(command))
+                .await
+                .map_err(|e| crate::error::OctopiiError::Rpc(format!("client_write: {e}")))?;
+            return Ok(Bytes::from(resp.data.0));
+        }
+
+        // Not leader - forward to leader
+        let leader_id = metrics.current_leader
+            .ok_or_else(|| crate::error::OctopiiError::Rpc("No leader elected".to_string()))?;
+
+        let leader_addr = self.peer_addr_for(leader_id).await
+            .ok_or_else(|| crate::error::OctopiiError::NodeNotFound(leader_id))?;
+
+        tracing::info!(
+            "Node {}: Forwarding propose to leader {} at {}",
+            self.config.node_id, leader_id, leader_addr
+        );
+
+        // Forward via RPC
+        let response = self.rpc.request(
+            leader_addr,
+            crate::rpc::RequestPayload::Custom {
+                operation: "propose".to_string(),
+                data: Bytes::from(command),
+            },
+            Duration::from_secs(5),
+        ).await?;
+
+        match response.payload {
+            crate::rpc::ResponsePayload::CustomResponse { success: true, data } => Ok(data),
+            crate::rpc::ResponsePayload::CustomResponse { success: false, data } => {
+                Err(crate::error::OctopiiError::Rpc(String::from_utf8_lossy(&data).to_string()))
+            }
+            crate::rpc::ResponsePayload::Error { message } => Err(crate::error::OctopiiError::Rpc(message)),
+            _ => Err(crate::error::OctopiiError::Rpc("Unexpected response from leader".to_string())),
+        }
     }
 
     pub async fn query(&self, command: &[u8]) -> Result<Bytes> {
